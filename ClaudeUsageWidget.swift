@@ -9,7 +9,10 @@
 import Cocoa
 
 let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-let refreshInterval: TimeInterval = 60
+// Usage windows only move on hour/day timescales, and this endpoint has its
+// own (undocumented) rate limit — 60s polling tripped it. Hourly background
+// polling plus the manual "Refresh Now" item is plenty.
+let refreshInterval: TimeInterval = 3600
 let warnThreshold = 80.0
 
 // MARK: - Models
