@@ -36,6 +36,30 @@ struct ProfileUsage {
     var error: String?
 }
 
+// MARK: - Menu bar stat selection
+
+// Which stats the user has chosen to pin to the menu bar title (vs. only
+// seeing them in the dropdown). Persisted across launches.
+enum MenuBarStat: Int, CaseIterable {
+    case fiveHourPct = 0
+    case sevenDayPct = 1
+    case fiveHourReset = 2
+    case sevenDayReset = 3
+
+    static let defaultsKey = "anchoredStats"
+
+    static func loadAnchored() -> Set<MenuBarStat> {
+        if let raw = UserDefaults.standard.array(forKey: defaultsKey) as? [Int] {
+            return Set(raw.compactMap(MenuBarStat.init(rawValue:)))
+        }
+        return [.fiveHourPct, .sevenDayPct]  // matches the original menu bar layout
+    }
+
+    static func save(_ stats: Set<MenuBarStat>) {
+        UserDefaults.standard.set(stats.map { $0.rawValue }, forKey: defaultsKey)
+    }
+}
+
 // MARK: - Shell / Keychain
 
 func shell(_ args: [String]) -> String? {
@@ -158,11 +182,43 @@ func resetsIn(_ w: WindowUsage?) -> String {
     return "resets in \(m)m"
 }
 
+// Compact countdown for the menu bar title, e.g. "2h14m", "3d12h", "14m".
+func resetCountdownShort(_ w: WindowUsage?) -> String {
+    guard let d = w?.resetsAt else { return "–" }
+    let s = Int(d.timeIntervalSinceNow)
+    if s <= 0 { return "now" }
+    let h = s / 3600
+    let m = (s % 3600) / 60
+    if h >= 24 { return "\(h / 24)d\(h % 24)h" }
+    if h > 0 { return "\(h)h\(m)m" }
+    return "\(m)m"
+}
+
+func titleFragment(_ stat: MenuBarStat, _ p: ProfileUsage) -> String {
+    switch stat {
+    case .fiveHourPct: return pct(p.fiveHour)
+    case .sevenDayPct: return "🇼\(pct(p.sevenDay))"
+    case .fiveHourReset: return "⏳\(resetCountdownShort(p.fiveHour))"
+    case .sevenDayReset: return "🇼⏳\(resetCountdownShort(p.sevenDay))"
+    }
+}
+
+func statMenuTitle(_ stat: MenuBarStat, _ p: ProfileUsage) -> String {
+    switch stat {
+    case .fiveHourPct: return "5-hour usage: \(pct(p.fiveHour))"
+    case .sevenDayPct: return "Weekly usage: \(pct(p.sevenDay))"
+    case .fiveHourReset: return "5-hour \(resetsIn(p.fiveHour))"
+    case .sevenDayReset: return "Weekly \(resetsIn(p.sevenDay))"
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
+    var lastProfiles: [ProfileUsage] = []
+    var anchored: Set<MenuBarStat> = MenuBarStat.loadAnchored()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -181,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func updateUI(_ profiles: [ProfileUsage]) {
+        lastProfiles = profiles
         let menu = NSMenu()
 
         if profiles.isEmpty {
@@ -189,18 +246,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(disabled("Open Claude Code once, then Refresh"))
         } else {
             // Prefer a profile that actually has windowed limits (enterprise/API plans return none)
-            let primary = profiles.first(where: { $0.fiveHour != nil }) ?? profiles[0]
+            let primaryIndex = profiles.firstIndex(where: { $0.fiveHour != nil }) ?? 0
+            let primary = profiles[primaryIndex]
+            let hasLimits = primary.fiveHour != nil || primary.sevenDay != nil
             let warn = [primary.fiveHour, primary.sevenDay]
                 .compactMap { $0?.utilization }
                 .contains { $0 >= warnThreshold }
-            statusItem.button?.title = "\(warn ? "⚠️" : "⚡")\(pct(primary.fiveHour)) · 🇼\(pct(primary.sevenDay))"
+            let statusIcon = warn ? "⚠️" : "⚡"
 
-            for p in profiles {
+            if hasLimits {
+                let order: [MenuBarStat] = [.fiveHourPct, .sevenDayPct, .fiveHourReset, .sevenDayReset]
+                let fragments = order.filter { anchored.contains($0) }.map { titleFragment($0, primary) }
+                statusItem.button?.title = fragments.isEmpty ? statusIcon : "\(statusIcon) " + fragments.joined(separator: " · ")
+            } else {
+                statusItem.button?.title = statusIcon
+            }
+
+            for (idx, p) in profiles.enumerated() {
                 menu.addItem(disabled(p.label.uppercased()))
                 if let err = p.error {
                     menu.addItem(disabled("  error: \(err)"))
                 } else if p.fiveHour == nil && p.sevenDay == nil {
                     menu.addItem(disabled("  no rolling limits on this plan"))
+                } else if idx == primaryIndex {
+                    menu.addItem(disabled("  pin to menu bar:"))
+                    for stat in MenuBarStat.allCases {
+                        let item = NSMenuItem(title: statMenuTitle(stat, p), action: #selector(toggleStat(_:)), keyEquivalent: "")
+                        item.target = self
+                        item.tag = stat.rawValue
+                        item.state = anchored.contains(stat) ? .on : .off
+                        menu.addItem(item)
+                    }
                 } else {
                     menu.addItem(disabled("  5-hour:  \(pct(p.fiveHour))   \(resetsIn(p.fiveHour))"))
                     menu.addItem(disabled("  weekly:  \(pct(p.sevenDay))   \(resetsIn(p.sevenDay))"))
@@ -220,6 +296,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         statusItem.menu = menu
+    }
+
+    @objc func toggleStat(_ sender: NSMenuItem) {
+        guard let stat = MenuBarStat(rawValue: sender.tag) else { return }
+        if anchored.contains(stat) {
+            anchored.remove(stat)
+        } else {
+            anchored.insert(stat)
+        }
+        MenuBarStat.save(anchored)
+        updateUI(lastProfiles)
     }
 
     private func disabled(_ title: String) -> NSMenuItem {
