@@ -15,6 +15,10 @@ let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 let refreshInterval: TimeInterval = 3600
 let warnThreshold = 80.0
 
+// OAuth token refresh — standard public Claude Code OAuth client values.
+let oauthTokenURL = URL(string: "https://console.anthropic.com/v1/oauth/token")!
+let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
 // MARK: - Models
 
 struct WindowUsage {
@@ -94,6 +98,74 @@ func keychainServices() -> [String] {
     return sorted
 }
 
+// Like shell(), but returns combined stdout+stderr — needed for
+// `security find-generic-password -g`, which prints attributes to stderr.
+func shellCombined(_ args: [String]) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe
+    do { try p.run() } catch { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
+// The keychain account ("acct") for a service, needed to update the right item.
+func keychainAccount(_ service: String) -> String? {
+    guard let dump = shellCombined(["security", "find-generic-password", "-s", service, "-g"]) else { return nil }
+    for line in dump.split(separator: "\n") {
+        guard let r = line.range(of: "\"acct\"<blob>=\"") else { continue }
+        let rest = line[r.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { continue }
+        return String(rest[..<end])
+    }
+    return nil
+}
+
+// Updates the Keychain entry's password (the credential JSON) in place.
+func writeKeychainCredential(service: String, account: String, json: String) -> Bool {
+    return shell(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", json]) != nil
+}
+
+// Exchanges a refresh token for a fresh access/refresh token pair.
+// Returns the parsed JSON dict from the OAuth endpoint, or nil on failure.
+func performTokenRefresh(refreshToken: String) -> [String: Any]? {
+    var req = URLRequest(url: oauthTokenURL)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 15
+    let payload: [String: Any] = [
+        "grant_type": "refresh_token",
+        "refresh_token": refreshToken,
+        "client_id": oauthClientID,
+    ]
+    guard let bodyData = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+    req.httpBody = bodyData
+
+    let sem = DispatchSemaphore(value: 0)
+    var respData: Data?
+    var netError: Error?
+    URLSession.shared.dataTask(with: req) { d, _, e in
+        respData = d
+        netError = e
+        sem.signal()
+    }.resume()
+    sem.wait()
+
+    guard netError == nil, let respData,
+          let obj = (try? JSONSerialization.jsonObject(with: respData)) as? [String: Any],
+          obj["error"] == nil,
+          obj["access_token"] is String,
+          obj["refresh_token"] is String,
+          (obj["expires_in"] as? Double) != nil
+    else { return nil }
+    return obj
+}
+
 func loadCredentials() -> [Credential] {
     var creds: [Credential] = []
     for svc in keychainServices() {
@@ -101,11 +173,41 @@ func loadCredentials() -> [Credential] {
               let data = raw.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let oauth = obj["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String,
+              var token = oauth["accessToken"] as? String,
               let expMs = oauth["expiresAt"] as? Double
         else { continue }
-        let exp = Date(timeIntervalSince1970: expMs / 1000)
-        guard exp > Date() else { continue }  // stale token; Claude Code refreshes it on next use
+        var exp = Date(timeIntervalSince1970: expMs / 1000)
+
+        // Expired or about to expire — self-refresh if we have a refresh token.
+        if exp <= Date().addingTimeInterval(60),
+           let refreshToken = oauth["refreshToken"] as? String, !refreshToken.isEmpty {
+            guard let result = performTokenRefresh(refreshToken: refreshToken),
+                  let newToken = result["access_token"] as? String,
+                  let newRefresh = result["refresh_token"] as? String,
+                  let expiresIn = result["expires_in"] as? Double
+            else { continue }  // refresh failed; skip this credential
+
+            let newExpMs = Date().timeIntervalSince1970 * 1000 + expiresIn * 1000
+            var updatedOauth = oauth
+            updatedOauth["accessToken"] = newToken
+            updatedOauth["refreshToken"] = newRefresh
+            updatedOauth["expiresAt"] = newExpMs
+
+            var updatedObj = obj
+            updatedObj["claudeAiOauth"] = updatedOauth
+
+            if let updatedData = try? JSONSerialization.data(withJSONObject: updatedObj),
+               let updatedJSON = String(data: updatedData, encoding: .utf8),
+               let account = keychainAccount(svc) {
+                _ = writeKeychainCredential(service: svc, account: account, json: updatedJSON)
+            }
+
+            token = newToken
+            exp = Date(timeIntervalSince1970: newExpMs / 1000)
+        } else if exp <= Date() {
+            continue  // expired and no usable refresh token; Claude Code refreshes it on next use
+        }
+
         let sub = (oauth["subscriptionType"] as? String) ?? "profile"
         let suffix = svc.replacingOccurrences(of: "Claude Code-credentials", with: "")
         let label = suffix.isEmpty ? sub : "\(sub) (\(suffix.dropFirst()))"
