@@ -347,10 +347,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func refresh() {
+        refreshInternal(isManual: false)
+    }
+
+    @objc func manualRefresh() {
+        refreshInternal(isManual: true)
+    }
+
+    private func refreshInternal(isManual: Bool) {
         DispatchQueue.global(qos: .utility).async {
             let profiles = loadCredentials().map(fetchUsage)
             DispatchQueue.main.async { [weak self] in
-                self?.updateUI(profiles)
+                self?.updateUI(profiles, isManual: isManual)
             }
         }
     }
@@ -371,7 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    private func isCliRecentlyActive() -> Bool {
+    func isCliRecentlyActive() -> Bool {
         let fileManager = FileManager.default
         let homeDir = fileManager.homeDirectoryForCurrentUser
         let claudeDir = homeDir.appendingPathComponent(".claude")
@@ -395,25 +403,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let elapsed = Date().timeIntervalSince(mostRecent)
+        print("[isCliRecentlyActive] Most recent file mod date: \(mostRecent), elapsed: \(elapsed)s")
         return elapsed < 600 // 10 minutes
     }
 
-    func updateUI(_ profiles: [ProfileUsage]) {
+    func updateUI(_ profiles: [ProfileUsage], isManual: Bool = false) {
         let active = isCliRecentlyActive()
         let changed = hasSignificantChange(old: lastProfiles, new: profiles)
 
-        if active || changed {
+        print("[updateUI] active: \(active), changed: \(changed), isManual: \(isManual), currentInterval: \(currentInterval), staleChecksCount: \(staleChecksCount)")
+
+        if isManual || active || changed {
             let oldInterval = currentInterval
             currentInterval = 60 // 1 minute
             staleChecksCount = 0
             if oldInterval != 60 {
+                print("[updateUI] Rescheduling timer to 60s (active/changed/manual)")
                 scheduleTimer()
             }
         } else if !lastProfiles.isEmpty {
             if currentInterval < 3600 {
                 staleChecksCount += 1
+                print("[updateUI] Usage stale. Incrementing staleChecksCount to \(staleChecksCount)")
                 if staleChecksCount > 2 {
                     staleChecksCount = 0
+                    let oldInterval = currentInterval
                     if currentInterval == 60 {
                         currentInterval = 150
                     } else if currentInterval == 150 {
@@ -425,6 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     } else {
                         currentInterval = 3600
                     }
+                    print("[updateUI] Decaying interval from \(oldInterval)s to \(currentInterval)s")
                     scheduleTimer()
                 }
             }
@@ -479,7 +494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(manualRefresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
@@ -528,6 +543,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Entry point
 
 if CommandLine.arguments.contains("--once") {
+    let delegate = AppDelegate()
+    _ = delegate.isCliRecentlyActive()
     let creds = loadCredentials()
     if creds.isEmpty {
         print("No fresh Claude Code credentials found in Keychain.")
