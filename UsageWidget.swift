@@ -1,4 +1,4 @@
-// Claude Usage Widget — menu-bar monitor for Claude Code subscription limits.
+// Usage Widget — menu-bar monitor for Claude Code subscription limits.
 //
 // Reads Claude Code's OAuth tokens from the macOS Keychain (one entry per
 // profile/config dir) and polls the same endpoint the in-app /usage screen

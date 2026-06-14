@@ -1,4 +1,4 @@
-# Claude Usage Widget
+# Usage Widget
 
 A tiny native macOS menu-bar app that shows your Claude Code subscription
 usage (5-hour and weekly rolling limits) at a glance.
@@ -26,7 +26,7 @@ Requires Xcode command line tools (`swiftc`, `iconutil`, `sips`,
 ```
 
 This compiles the app, bundles `AppIcon.icns`, ad-hoc signs it, and
-installs `Claude Usage.app` to `~/Applications/`. Launch it from
+installs `Usage Widget.app` to `~/Applications/`. Launch it from
 Spotlight or Finder; quit it from its own menu bar dropdown.
 
 To regenerate the app icon from scratch:
@@ -41,7 +41,7 @@ iconutil -c icns AppIcon.iconset -o AppIcon.icns
 ## CLI mode
 
 ```sh
-./ClaudeUsage --once
+./UsageWidget --once
 ```
 
 Prints usage for each detected profile and exits — useful for testing
