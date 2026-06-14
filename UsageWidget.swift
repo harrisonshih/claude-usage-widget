@@ -10,9 +10,8 @@ import Cocoa
 
 let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 // Usage windows only move on hour/day timescales, and this endpoint has its
-// own (undocumented) rate limit — 60s polling tripped it. Hourly background
-// polling plus the manual "Refresh Now" item is plenty.
-let refreshInterval: TimeInterval = 3600
+// own (undocumented) rate limit. We adaptively poll (e.g. hourly by default,
+// boosting to 2.5m on changes, then decaying to 5m -> 15m -> 30m -> 1h).
 let warnThreshold = 80.0
 
 // OAuth token refresh — standard public Claude Code OAuth client values.
@@ -322,11 +321,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastProfiles: [ProfileUsage] = []
     var anchored: Set<MenuBarStat> = MenuBarStat.loadAnchored()
 
+    var currentInterval: TimeInterval = 3600
+    var staleChecksCount: Int = 0
+    var lastUpdate: Date = Date()
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "⚡…"
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        scheduleTimer()
+    }
+
+    func scheduleTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: currentInterval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
@@ -334,12 +342,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func refresh() {
         DispatchQueue.global(qos: .utility).async {
             let profiles = loadCredentials().map(fetchUsage)
-            DispatchQueue.main.async { self.updateUI(profiles) }
+            DispatchQueue.main.async { [weak self] in
+                self?.updateUI(profiles)
+            }
         }
     }
 
+    private func hasSignificantChange(old: [ProfileUsage], new: [ProfileUsage]) -> Bool {
+        if old.isEmpty { return false }
+        if old.count != new.count { return true }
+        for newP in new {
+            guard let oldP = old.first(where: { $0.label == newP.label }) else { return true }
+            let old5h = oldP.fiveHour.map { $0.utilization.rounded() }
+            let new5h = newP.fiveHour.map { $0.utilization.rounded() }
+            let old7d = oldP.sevenDay.map { $0.utilization.rounded() }
+            let new7d = newP.sevenDay.map { $0.utilization.rounded() }
+            if old5h != new5h || old7d != new7d {
+                return true
+            }
+        }
+        return false
+    }
+
     func updateUI(_ profiles: [ProfileUsage]) {
+        let changed = hasSignificantChange(old: lastProfiles, new: profiles)
+
+        if changed {
+            currentInterval = 150 // 2.5 minutes
+            staleChecksCount = 0
+            scheduleTimer()
+        } else if !lastProfiles.isEmpty {
+            if currentInterval < 3600 {
+                staleChecksCount += 1
+                if staleChecksCount > 2 {
+                    staleChecksCount = 0
+                    if currentInterval == 150 {
+                        currentInterval = 300
+                    } else if currentInterval == 300 {
+                        currentInterval = 900
+                    } else if currentInterval == 900 {
+                        currentInterval = 1800
+                    } else {
+                        currentInterval = 3600
+                    }
+                    scheduleTimer()
+                }
+            }
+        }
+
         lastProfiles = profiles
+        lastUpdate = Date()
         let menu = NSMenu()
 
         if profiles.isEmpty {
@@ -393,7 +445,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm"
-        menu.addItem(disabled("Updated \(fmt.string(from: Date())) · auto-refreshes every \(Int(refreshInterval))s"))
+
+        let intervalStr: String
+        if currentInterval < 60 {
+            intervalStr = "\(Int(currentInterval))s"
+        } else if currentInterval < 3600 {
+            let mins = currentInterval / 60
+            if mins.truncatingRemainder(dividingBy: 1) == 0 {
+                intervalStr = "\(Int(mins))m"
+            } else {
+                intervalStr = String(format: "%.1fm", mins)
+            }
+        } else {
+            intervalStr = "\(Int(currentInterval / 3600))h"
+        }
+        menu.addItem(disabled("Updated \(fmt.string(from: Date())) · auto-refreshes every \(intervalStr)"))
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
