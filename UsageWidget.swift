@@ -408,8 +408,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func updateUI(_ profiles: [ProfileUsage], isManual: Bool = false) {
+        let relevantProfiles = profiles.filter { p in
+            return p.fiveHour != nil || p.sevenDay != nil || p.error != nil
+        }
+
         let active = isCliRecentlyActive()
-        let changed = hasSignificantChange(old: lastProfiles, new: profiles)
+        let changed = hasSignificantChange(old: lastProfiles, new: relevantProfiles)
 
         print("[updateUI] active: \(active), changed: \(changed), isManual: \(isManual), currentInterval: \(currentInterval), staleChecksCount: \(staleChecksCount)")
 
@@ -445,18 +449,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        lastProfiles = profiles
+        lastProfiles = relevantProfiles
         lastUpdate = Date()
         let menu = NSMenu()
 
-        if profiles.isEmpty {
+        if relevantProfiles.isEmpty {
             statusItem.button?.title = "⚡ login?"
             menu.addItem(disabled("No fresh Claude Code token found"))
             menu.addItem(disabled("Open Claude Code once, then Refresh"))
         } else {
-            // Prefer a profile that actually has windowed limits (enterprise/API plans return none)
-            let primaryIndex = profiles.firstIndex(where: { $0.fiveHour != nil }) ?? 0
-            let primary = profiles[primaryIndex]
+            let primaryIndex = relevantProfiles.firstIndex(where: { $0.fiveHour != nil }) ?? 0
+            let primary = relevantProfiles[primaryIndex]
             let hasLimits = primary.fiveHour != nil || primary.sevenDay != nil
             let warn = [primary.fiveHour, primary.sevenDay]
                 .compactMap { $0?.utilization }
@@ -471,12 +474,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 statusItem.button?.title = statusIcon
             }
 
-            for (idx, p) in profiles.enumerated() {
+            for (idx, p) in relevantProfiles.enumerated() {
                 menu.addItem(disabled(p.label.uppercased()))
                 if let err = p.error {
                     menu.addItem(disabled("  error: \(err)"))
-                } else if p.fiveHour == nil && p.sevenDay == nil {
-                    menu.addItem(disabled("  no rolling limits on this plan"))
                 } else if idx == primaryIndex {
                     menu.addItem(disabled("  pin to menu bar:"))
                     for stat in MenuBarStat.allCases {
@@ -550,11 +551,16 @@ if CommandLine.arguments.contains("--once") {
         print("No fresh Claude Code credentials found in Keychain.")
         exit(1)
     }
-    for p in creds.map(fetchUsage) {
+    let relevantProfiles = creds.map(fetchUsage).filter { p in
+        return p.fiveHour != nil || p.sevenDay != nil || p.error != nil
+    }
+    if relevantProfiles.isEmpty {
+        print("No profiles with rolling limits found.")
+        exit(0)
+    }
+    for p in relevantProfiles {
         if let err = p.error {
             print("\(p.label): error — \(err)")
-        } else if p.fiveHour == nil && p.sevenDay == nil {
-            print("\(p.label): no rolling limits on this plan")
         } else {
             print("\(p.label): 5h \(pct(p.fiveHour)) (\(resetsIn(p.fiveHour))), weekly \(pct(p.sevenDay)) (\(resetsIn(p.sevenDay)))")
         }
