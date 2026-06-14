@@ -212,8 +212,13 @@ func loadCredentials() -> [Credential] {
         let label = suffix.isEmpty ? sub : "\(sub) (\(suffix.dropFirst()))"
         creds.append(Credential(service: svc, token: token, expiresAt: exp, label: label))
     }
-    // Most recently refreshed first — that's the profile currently in use
-    return creds.sorted { $0.expiresAt > $1.expiresAt }
+    // Most recently refreshed first — that's the profile currently in use.
+    // We only keep the single newest one to prevent duplicate profiles and extra API requests.
+    let sorted = creds.sorted { $0.expiresAt > $1.expiresAt }
+    if let newest = sorted.first {
+        return [newest]
+    }
+    return []
 }
 
 // MARK: - API
