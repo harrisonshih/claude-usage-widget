@@ -250,9 +250,16 @@ func fetchUsage(_ cred: Credential) -> ProfileUsage {
         result.error = e.localizedDescription
         return result
     }
-    guard let body,
-          let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
-    else {
+    guard let body else {
+        result.error = "empty response"
+        return result
+    }
+    if CommandLine.arguments.contains("--once") {
+        if let jsonString = String(data: body, encoding: .utf8) {
+            print("RAW JSON for \(cred.label): \(jsonString)")
+        }
+    }
+    guard let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
         result.error = "unparseable response"
         return result
     }
@@ -364,13 +371,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    private func isCliRecentlyActive() -> Bool {
+        let fileManager = FileManager.default
+        let homeDir = fileManager.homeDirectoryForCurrentUser
+        let claudeDir = homeDir.appendingPathComponent(".claude")
+        let historyFile = claudeDir.appendingPathComponent("history.jsonl")
+        let sessionsDir = claudeDir.appendingPathComponent("sessions")
+
+        var checkURLs = [historyFile]
+
+        if let contents = try? fileManager.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            checkURLs.append(contentsOf: contents)
+        }
+
+        var mostRecent = Date.distantPast
+        for url in checkURLs {
+            if let resourceValues = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+               let modDate = resourceValues.contentModificationDate {
+                if modDate > mostRecent {
+                    mostRecent = modDate
+                }
+            }
+        }
+
+        let elapsed = Date().timeIntervalSince(mostRecent)
+        return elapsed < 600 // 10 minutes
+    }
+
     func updateUI(_ profiles: [ProfileUsage]) {
+        let active = isCliRecentlyActive()
         let changed = hasSignificantChange(old: lastProfiles, new: profiles)
 
-        if changed {
+        if active || changed {
+            let oldInterval = currentInterval
             currentInterval = 60 // 1 minute
             staleChecksCount = 0
-            scheduleTimer()
+            if oldInterval != 60 {
+                scheduleTimer()
+            }
         } else if !lastProfiles.isEmpty {
             if currentInterval < 3600 {
                 staleChecksCount += 1
