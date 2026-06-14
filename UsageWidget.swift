@@ -368,7 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let changed = hasSignificantChange(old: lastProfiles, new: profiles)
 
         if changed {
-            currentInterval = 150 // 2.5 minutes
+            currentInterval = 60 // 1 minute
             staleChecksCount = 0
             scheduleTimer()
         } else if !lastProfiles.isEmpty {
@@ -376,7 +376,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 staleChecksCount += 1
                 if staleChecksCount > 2 {
                     staleChecksCount = 0
-                    if currentInterval == 150 {
+                    if currentInterval == 60 {
+                        currentInterval = 150
+                    } else if currentInterval == 150 {
                         currentInterval = 300
                     } else if currentInterval == 300 {
                         currentInterval = 900
