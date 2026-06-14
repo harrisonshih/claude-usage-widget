@@ -37,6 +37,10 @@ struct ProfileUsage {
     var fiveHour: WindowUsage?
     var sevenDay: WindowUsage?
     var error: String?
+    // Set when the endpoint refuses with a rate limit (HTTP 429 / Retry-After).
+    // Seconds to wait before polling again — drives a hard backoff so we stop
+    // hammering the endpoint regardless of the adaptive activity cadence.
+    var retryAfter: TimeInterval?
 }
 
 // MARK: - Menu bar stat selection
@@ -244,9 +248,17 @@ func fetchUsage(_ cred: Credential) -> ProfileUsage {
     let sem = DispatchSemaphore(value: 0)
     var body: Data?
     var netError: Error?
-    URLSession.shared.dataTask(with: req) { d, _, e in
+    var status = 0
+    var retryAfter: TimeInterval?
+    URLSession.shared.dataTask(with: req) { d, r, e in
         body = d
         netError = e
+        if let http = r as? HTTPURLResponse {
+            status = http.statusCode
+            if let ra = http.value(forHTTPHeaderField: "Retry-After"), let secs = Double(ra) {
+                retryAfter = secs
+            }
+        }
         sem.signal()
     }.resume()
     sem.wait()
@@ -255,21 +267,29 @@ func fetchUsage(_ cred: Credential) -> ProfileUsage {
         result.error = e.localizedDescription
         return result
     }
-    guard let body else {
-        result.error = "empty response"
+    if CommandLine.arguments.contains("--once"), let body, let jsonString = String(data: body, encoding: .utf8) {
+        print("RAW JSON for \(cred.label): \(jsonString)")
+    }
+    let obj = body.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+    let apiMessage = (obj?["error"] as? [String: Any])?["message"] as? String
+
+    // 429 (or an explicit Retry-After) means the endpoint is throttling us;
+    // surface the status and trigger a hard backoff in the scheduler.
+    if status == 429 || retryAfter != nil {
+        result.retryAfter = retryAfter ?? 300  // default 5m cooldown if unspecified
+        result.error = "rate-limited: \(apiMessage ?? "request not allowed right now")"
         return result
     }
-    if CommandLine.arguments.contains("--once") {
-        if let jsonString = String(data: body, encoding: .utf8) {
-            print("RAW JSON for \(cred.label): \(jsonString)")
-        }
+    if status != 0 && status != 200 {
+        result.error = "HTTP \(status): \(apiMessage ?? "request failed")"
+        return result
     }
-    guard let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+    if let apiMessage {
+        result.error = apiMessage
+        return result
+    }
+    guard let obj else {
         result.error = "unparseable response"
-        return result
-    }
-    if let err = obj["error"] as? [String: Any] {
-        result.error = (err["message"] as? String) ?? "API error"
         return result
     }
     result.fiveHour = parseWindow(obj["five_hour"])
@@ -422,7 +442,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         print("[updateUI] active: \(active), changed: \(changed), isManual: \(isManual), currentInterval: \(currentInterval), staleChecksCount: \(staleChecksCount)")
 
-        if isManual || active || changed {
+        if let cooldown = relevantProfiles.compactMap({ $0.retryAfter }).max() {
+            // Endpoint is throttling us — back off hard until the cooldown
+            // elapses, overriding the adaptive cadence (even a manual refresh).
+            let oldInterval = currentInterval
+            currentInterval = max(cooldown, 60)
+            staleChecksCount = 0
+            if oldInterval != currentInterval {
+                print("[updateUI] Rate-limited; backing off to \(currentInterval)s")
+                scheduleTimer()
+            }
+        } else if isManual || active || changed {
             let oldInterval = currentInterval
             currentInterval = 60 // 1 minute
             staleChecksCount = 0
