@@ -353,11 +353,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if old.count != new.count { return true }
         for newP in new {
             guard let oldP = old.first(where: { $0.label == newP.label }) else { return true }
-            let old5h = oldP.fiveHour.map { $0.utilization.rounded() }
-            let new5h = newP.fiveHour.map { $0.utilization.rounded() }
-            let old7d = oldP.sevenDay.map { $0.utilization.rounded() }
-            let new7d = newP.sevenDay.map { $0.utilization.rounded() }
-            if old5h != new5h || old7d != new7d {
+            let old5h = oldP.fiveHour?.utilization ?? 0.0
+            let new5h = newP.fiveHour?.utilization ?? 0.0
+            let old7d = oldP.sevenDay?.utilization ?? 0.0
+            let new7d = newP.sevenDay?.utilization ?? 0.0
+            if new5h > old5h || new7d > old7d {
                 return true
             }
         }
