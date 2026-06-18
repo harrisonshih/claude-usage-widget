@@ -41,6 +41,7 @@ struct ProfileUsage {
     // Seconds to wait before polling again — drives a hard backoff so we stop
     // hammering the endpoint regardless of the adaptive activity cadence.
     var retryAfter: TimeInterval?
+    var extraUsageCost: Double?
 }
 
 // MARK: - Menu bar stat selection
@@ -52,6 +53,7 @@ enum MenuBarStat: Int, CaseIterable {
     case sevenDayPct = 1
     case fiveHourReset = 2
     case sevenDayReset = 3
+    case extraCost = 4
 
     static let defaultsKey = "anchoredStats"
 
@@ -294,6 +296,12 @@ func fetchUsage(_ cred: Credential) -> ProfileUsage {
     }
     result.fiveHour = parseWindow(obj["five_hour"])
     result.sevenDay = parseWindow(obj["seven_day"])
+
+    if let extraUsage = obj["extra_usage"] as? [String: Any],
+       let usedCredits = extraUsage["used_credits"] as? Double {
+        result.extraUsageCost = usedCredits
+    }
+
     return result
 }
 
@@ -333,6 +341,11 @@ func titleFragment(_ stat: MenuBarStat, _ p: ProfileUsage) -> String {
     case .sevenDayPct: return "🇼\(pct(p.sevenDay))"
     case .fiveHourReset: return "⏳\(resetCountdownShort(p.fiveHour))"
     case .sevenDayReset: return "🇼⏳\(resetCountdownShort(p.sevenDay))"
+    case .extraCost:
+        if let cost = p.extraUsageCost, cost > 0, ((p.fiveHour?.utilization ?? 0) >= 100 || (p.sevenDay?.utilization ?? 0) >= 100) {
+            return String(format: "💸$%.2f", cost)
+        }
+        return ""
     }
 }
 
@@ -342,6 +355,11 @@ func statMenuTitle(_ stat: MenuBarStat, _ p: ProfileUsage) -> String {
     case .sevenDayPct: return "Weekly usage: \(pct(p.sevenDay))"
     case .fiveHourReset: return "5-hour \(resetsIn(p.fiveHour))"
     case .sevenDayReset: return "Weekly \(resetsIn(p.sevenDay))"
+    case .extraCost:
+        if let cost = p.extraUsageCost {
+            return "Extra cost: \(String(format: "$%.2f", cost))"
+        }
+        return "Extra cost: $0.00"
     }
 }
 
@@ -397,7 +415,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let new5h = newP.fiveHour?.utilization ?? 0.0
             let old7d = oldP.sevenDay?.utilization ?? 0.0
             let new7d = newP.sevenDay?.utilization ?? 0.0
-            if new5h > old5h || new7d > old7d {
+            let oldCost = oldP.extraUsageCost ?? 0.0
+            let newCost = newP.extraUsageCost ?? 0.0
+            if new5h > old5h || new7d > old7d || newCost > oldCost {
                 return true
             }
         }
@@ -502,8 +522,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let statusIcon = warn ? "⚠️" : "⚡"
 
             if hasLimits {
-                let order: [MenuBarStat] = [.fiveHourPct, .sevenDayPct, .fiveHourReset, .sevenDayReset]
-                let fragments = order.filter { anchored.contains($0) }.map { titleFragment($0, primary) }
+                let order: [MenuBarStat] = [.fiveHourPct, .sevenDayPct, .fiveHourReset, .sevenDayReset, .extraCost]
+                let fragments = order.filter { anchored.contains($0) }.map { titleFragment($0, primary) }.filter { !$0.isEmpty }
                 statusItem.button?.title = fragments.isEmpty ? statusIcon : "\(statusIcon) " + fragments.joined(separator: " · ")
             } else {
                 statusItem.button?.title = statusIcon
@@ -525,6 +545,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     menu.addItem(disabled("  5-hour:  \(pct(p.fiveHour))   \(resetsIn(p.fiveHour))"))
                     menu.addItem(disabled("  weekly:  \(pct(p.sevenDay))   \(resetsIn(p.sevenDay))"))
+                    if let cost = p.extraUsageCost, cost > 0, ((p.fiveHour?.utilization ?? 0) >= 100 || (p.sevenDay?.utilization ?? 0) >= 100) {
+                        menu.addItem(disabled("  extra cost: \(String(format: "$%.2f", cost))"))
+                    }
                 }
                 menu.addItem(.separator())
             }
@@ -597,7 +620,11 @@ if CommandLine.arguments.contains("--once") {
         if let err = p.error {
             print("\(p.label): error — \(err)")
         } else {
-            print("\(p.label): 5h \(pct(p.fiveHour)) (\(resetsIn(p.fiveHour))), weekly \(pct(p.sevenDay)) (\(resetsIn(p.sevenDay)))")
+            var out = "\(p.label): 5h \(pct(p.fiveHour)) (\(resetsIn(p.fiveHour))), weekly \(pct(p.sevenDay)) (\(resetsIn(p.sevenDay)))"
+            if let cost = p.extraUsageCost, cost > 0 {
+                out += String(format: ", extra cost: $%.2f", cost)
+            }
+            print(out)
         }
     }
     exit(0)
