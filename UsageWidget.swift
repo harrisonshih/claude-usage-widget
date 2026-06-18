@@ -61,7 +61,7 @@ enum MenuBarStat: Int, CaseIterable {
         if let raw = UserDefaults.standard.array(forKey: defaultsKey) as? [Int] {
             return Set(raw.compactMap(MenuBarStat.init(rawValue:)))
         }
-        return [.fiveHourPct, .sevenDayPct]  // matches the original menu bar layout
+        return [.fiveHourPct, .sevenDayPct, .extraCost]  // matches the original layout + extra usage cost
     }
 
     static func save(_ stats: Set<MenuBarStat>) {
@@ -214,6 +214,9 @@ func loadCredentials() -> [Credential] {
         }
 
         let sub = (oauth["subscriptionType"] as? String) ?? "profile"
+        if sub.lowercased().contains("enterprise") || sub.lowercased().contains("api") {
+            continue
+        }
         let suffix = svc.replacingOccurrences(of: "Claude Code-credentials", with: "")
         let label = suffix.isEmpty ? sub : "\(sub) (\(suffix.dropFirst()))"
         creds.append(Credential(service: svc, token: token, expiresAt: exp, label: label))
@@ -299,7 +302,8 @@ func fetchUsage(_ cred: Credential) -> ProfileUsage {
 
     if let extraUsage = obj["extra_usage"] as? [String: Any],
        let usedCredits = extraUsage["used_credits"] as? Double {
-        result.extraUsageCost = usedCredits
+        let decimalPlaces = (extraUsage["decimal_places"] as? Int) ?? 0
+        result.extraUsageCost = usedCredits / pow(10.0, Double(decimalPlaces))
     }
 
     return result
@@ -371,8 +375,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastProfiles: [ProfileUsage] = []
     var anchored: Set<MenuBarStat> = MenuBarStat.loadAnchored()
 
-    var currentInterval: TimeInterval = 3600
-    var staleChecksCount: Int = 0
     var lastUpdate: Date = Date()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -384,8 +386,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func scheduleTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: currentInterval, repeats: true) { [weak self] _ in
-            self?.refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.timerTicked()
         }
     }
 
@@ -398,30 +400,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshInternal(isManual: Bool) {
-        DispatchQueue.global(qos: .utility).async {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             let profiles = loadCredentials().map(fetchUsage)
-            DispatchQueue.main.async { [weak self] in
+            self?.logUsage(profiles)
+            DispatchQueue.main.async {
+                self?.lastUpdate = Date()
                 self?.updateUI(profiles, isManual: isManual)
             }
         }
     }
 
-    private func hasSignificantChange(old: [ProfileUsage], new: [ProfileUsage]) -> Bool {
-        if old.isEmpty { return false }
-        if old.count != new.count { return true }
-        for newP in new {
-            guard let oldP = old.first(where: { $0.label == newP.label }) else { return true }
-            let old5h = oldP.fiveHour?.utilization ?? 0.0
-            let new5h = newP.fiveHour?.utilization ?? 0.0
-            let old7d = oldP.sevenDay?.utilization ?? 0.0
-            let new7d = newP.sevenDay?.utilization ?? 0.0
-            let oldCost = oldP.extraUsageCost ?? 0.0
-            let newCost = newP.extraUsageCost ?? 0.0
-            if new5h > old5h || new7d > old7d || newCost > oldCost {
-                return true
+    private func logUsage(_ profiles: [ProfileUsage]) {
+        let fileManager = FileManager.default
+        let homeDir = fileManager.homeDirectoryForCurrentUser
+        let claudeDir = homeDir.appendingPathComponent(".claude")
+        let logFile = claudeDir.appendingPathComponent("usage_log.jsonl")
+
+        if !fileManager.fileExists(atPath: claudeDir.path) {
+            try? fileManager.createDirectory(at: claudeDir, withIntermediateDirectories: true)
+        }
+
+        let now = Date()
+        let fmt = ISO8601DateFormatter()
+        let timestampStr = fmt.string(from: now)
+
+        for p in profiles {
+            guard p.error == nil, let fiveHour = p.fiveHour, let sevenDay = p.sevenDay else { continue }
+
+            var entry: [String: Any] = [
+                "timestamp": timestampStr,
+                "label": p.label,
+                "five_hour_utilization": fiveHour.utilization,
+                "seven_day_utilization": sevenDay.utilization
+            ]
+
+            if let resets5h = fiveHour.resetsAt {
+                entry["five_hour_resets_at"] = fmt.string(from: resets5h)
+            }
+            if let resets7d = sevenDay.resetsAt {
+                entry["seven_day_resets_at"] = fmt.string(from: resets7d)
+            }
+            if let cost = p.extraUsageCost {
+                entry["extra_usage_cost"] = cost
+            }
+
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: entry),
+                  let jsonString = String(data: jsonData, encoding: .utf8) else { continue }
+
+            let line = jsonString + "\n"
+
+            if let fileHandle = try? FileHandle(forWritingTo: logFile) {
+                defer { try? fileHandle.close() }
+                fileHandle.seekToEndOfFile()
+                if let lineData = line.data(using: .utf8) {
+                    fileHandle.write(lineData)
+                }
+            } else {
+                try? line.write(to: logFile, atomically: true, encoding: .utf8)
             }
         }
-        return false
+    }
+
+    func timerTicked() {
+        let elapsed = Date().timeIntervalSince(lastUpdate)
+        
+        // If we are rate-limited, respect the cooldown period
+        if let cooldown = lastProfiles.compactMap({ $0.retryAfter }).max(), elapsed < cooldown {
+            updateUI(lastProfiles, isManual: false)
+            return
+        }
+        
+        let active = isCliRecentlyActive()
+        if active || elapsed >= 3600 {
+            refreshInternal(isManual: false)
+        } else {
+            updateUI(lastProfiles, isManual: false)
+        }
     }
 
     func isCliRecentlyActive() -> Bool {
@@ -457,55 +511,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return p.fiveHour != nil || p.sevenDay != nil || p.error != nil
         }
 
-        let active = isCliRecentlyActive()
-        let changed = hasSignificantChange(old: lastProfiles, new: relevantProfiles)
-
-        print("[updateUI] active: \(active), changed: \(changed), isManual: \(isManual), currentInterval: \(currentInterval), staleChecksCount: \(staleChecksCount)")
-
-        if let cooldown = relevantProfiles.compactMap({ $0.retryAfter }).max() {
-            // Endpoint is throttling us — back off hard until the cooldown
-            // elapses, overriding the adaptive cadence (even a manual refresh).
-            let oldInterval = currentInterval
-            currentInterval = max(cooldown, 60)
-            staleChecksCount = 0
-            if oldInterval != currentInterval {
-                print("[updateUI] Rate-limited; backing off to \(currentInterval)s")
-                scheduleTimer()
-            }
-        } else if isManual || active || changed {
-            let oldInterval = currentInterval
-            currentInterval = 60 // 1 minute
-            staleChecksCount = 0
-            if oldInterval != 60 {
-                print("[updateUI] Rescheduling timer to 60s (active/changed/manual)")
-                scheduleTimer()
-            }
-        } else if !lastProfiles.isEmpty {
-            if currentInterval < 3600 {
-                staleChecksCount += 1
-                print("[updateUI] Usage stale. Incrementing staleChecksCount to \(staleChecksCount)")
-                if staleChecksCount > 2 {
-                    staleChecksCount = 0
-                    let oldInterval = currentInterval
-                    if currentInterval == 60 {
-                        currentInterval = 150
-                    } else if currentInterval == 150 {
-                        currentInterval = 300
-                    } else if currentInterval == 300 {
-                        currentInterval = 900
-                    } else if currentInterval == 900 {
-                        currentInterval = 1800
-                    } else {
-                        currentInterval = 3600
-                    }
-                    print("[updateUI] Decaying interval from \(oldInterval)s to \(currentInterval)s")
-                    scheduleTimer()
-                }
-            }
-        }
+        print("[updateUI] isManual: \(isManual), profilesCount: \(relevantProfiles.count)")
 
         lastProfiles = relevantProfiles
-        lastUpdate = Date()
         let menu = NSMenu()
 
         if relevantProfiles.isEmpty {
@@ -560,20 +568,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm"
 
-        let intervalStr: String
-        if currentInterval < 60 {
-            intervalStr = "\(Int(currentInterval))s"
-        } else if currentInterval < 3600 {
-            let mins = currentInterval / 60
-            if mins.truncatingRemainder(dividingBy: 1) == 0 {
-                intervalStr = "\(Int(mins))m"
-            } else {
-                intervalStr = String(format: "%.1fm", mins)
-            }
-        } else {
-            intervalStr = "\(Int(currentInterval / 3600))h"
-        }
-        menu.addItem(disabled("Updated \(fmt.string(from: Date())) · auto-refreshes every \(intervalStr)"))
+        let intervalStr = isCliRecentlyActive() ? "1m" : "1h"
+        menu.addItem(disabled("Updated \(fmt.string(from: lastUpdate)) · auto-refreshes every \(intervalStr)"))
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
