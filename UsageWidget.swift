@@ -219,12 +219,7 @@ func loadCredentials() -> [Credential] {
         creds.append(Credential(service: svc, token: token, expiresAt: exp, label: label))
     }
     // Most recently refreshed first — that's the profile currently in use.
-    // We only keep the single newest one to prevent duplicate profiles and extra API requests.
-    let sorted = creds.sorted { $0.expiresAt > $1.expiresAt }
-    if let newest = sorted.first {
-        return [newest]
-    }
-    return []
+    return creds.sorted { $0.expiresAt > $1.expiresAt }
 }
 
 // MARK: - API
@@ -303,6 +298,21 @@ func fetchUsage(_ cred: Credential) -> ProfileUsage {
     }
 
     return result
+}
+
+// Fetches newest-first and keeps only the first profile that actually has
+// rolling limits — enterprise/API profiles return null windows, and picking
+// by expiresAt alone can land on one of those. Stops at the first hit to
+// avoid extra API requests. Falls back to the newest errored profile so
+// rate-limit / auth errors still surface.
+func fetchPrimaryUsage(_ creds: [Credential]) -> [ProfileUsage] {
+    var fallback: ProfileUsage?
+    for cred in creds {
+        let p = fetchUsage(cred)
+        if p.fiveHour != nil || p.sevenDay != nil { return [p] }
+        if fallback == nil, p.error != nil { fallback = p }
+    }
+    return fallback.map { [$0] } ?? []
 }
 
 // MARK: - Formatting
@@ -399,7 +409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshInternal(isManual: Bool) {
         DispatchQueue.global(qos: .utility).async {
-            let profiles = loadCredentials().map(fetchUsage)
+            let profiles = fetchPrimaryUsage(loadCredentials())
             DispatchQueue.main.async { [weak self] in
                 self?.updateUI(profiles, isManual: isManual)
             }
@@ -609,9 +619,7 @@ if CommandLine.arguments.contains("--once") {
         print("No fresh Claude Code credentials found in Keychain.")
         exit(1)
     }
-    let relevantProfiles = creds.map(fetchUsage).filter { p in
-        return p.fiveHour != nil || p.sevenDay != nil || p.error != nil
-    }
+    let relevantProfiles = fetchPrimaryUsage(creds)
     if relevantProfiles.isEmpty {
         print("No profiles with rolling limits found.")
         exit(0)
