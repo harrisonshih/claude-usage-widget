@@ -2,3 +2,5 @@ UsageWidget
 Usage Widget.app/
 AppIcon.iconset/
 
+# Machine-local Finder metadata.
+.DS_Store
